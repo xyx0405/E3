@@ -1,0 +1,25 @@
+# 忽略数据文件夹（即使是软链接也会被忽略）
+data/
+train_data/
+test_data/
+
+# 忽略模型权重和预测结果
+models/
+checkpoints/
+results/
+*.pth
+*.ckpt
+
+# 忽略电镜大文件
+*.map
+*.map.gz
+*.mrc
+*.star
+
+# 忽略 Python 自动生成的缓存
+__pycache__/
+.ipynb_checkpoints/
+.vscode/
+
+# 忽略实验标记文件
+I_WAS_HERE.txt
