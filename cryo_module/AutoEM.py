@@ -19,6 +19,42 @@ import random
 from subprocess import run, DEVNULL
 
 
+"""
+File: AutoEM.py
+
+角色：密度图端的“前处理 + 结构建模”模块，是 E3-CryoFold pipeline 的前半段。
+
+从外部看，最重要的类和方法只有三个：
+
+class CryoProcesser:
+    - __init__(dynamic_config)
+        绑定命令行配置（map_path / fasta_path / protocol 等），初始化中间变量。
+
+    - get_spatial_feature(BB_model, CA_model, AA_model)
+        输入：
+          - BB_model / CA_model / AA_model: Cryo UNet 的三个 head
+        输出（挂在 self 上）：
+          - self.normEM: 预处理后的 3D density map
+          - self.CA_cands: Cα 候选点的连续坐标 (N, 3)
+          - self.CA_cands_AAProb / self.neigh_mat / self.neighbors2to6 等一系列下游需要的特征
+        内部步骤：
+          - checkSeq(): 解析 fasta（非 seq_free 协议）
+          - nnProcess(): preprocessEM → nnPred → clustering
+
+    - mapping()
+        输入：上一步得到的 Cα 候选点和序列信息
+        输出：
+          - X: 以 Cα 为核心的坐标序列（后续在 E3CryoFold2.generate_backbone_atoms 中变成 backbone）
+          - C: chain 编号（每个残基属于哪条链）
+          - S: 单字母氨基酸序列
+        内部步骤：
+          - fragModeling(): 用图算法把稀疏 Cα 候选点连成片段
+          - （非 seq_free）seqMapAligning() + initialModeling() + gapThreading(): 结合序列和局部几何做对齐与补洞
+
+注意：文件中还有大量对齐/评分/填补细节函数，你可以先只把上面三步当作“黑箱 API”，后面再按需深入。
+"""
+
+
 np.set_printoptions(threshold=np.inf,suppress=True,precision=2)
 
 class NNPred:
@@ -67,6 +103,9 @@ class GlobalParam:
 
 
     def update(self,AA_score,pair_scores,fastas=None,CA_cands=None,neighbors2to6=None,chain_cand_mat=None,matched_chains=None,trace_list=None,CAProb=None):
+        """
+        用新的全局变量刷新缓存，使得 pathWalking / 对齐评分等函数可以通过 globalParam 访问共享数据。
+        """
         self.seq_cand_AA_mat=AA_score
         self.neigh_mat=pair_scores
         self.fastas=fastas
@@ -81,6 +120,12 @@ globalParam = GlobalParam()
 
 
 def pathWalking(cand,n_hop):
+    """
+    从某个 Cα 候选点出发，在邻接图上做 n-hop 随机游走，得到“从该点出发走到其他点的概率分布”。
+
+    返回：
+        results[n][j] 表示：从起点出发，恰好走 n+1 步后，落在点 j 的最大累积得分。
+    """
     global globalParam
     traces=[[cand]]
     scores=[1]
@@ -110,6 +155,13 @@ def pathWalking(cand,n_hop):
 
 
 def calc_score(traces,chain_ix,this_seq):
+    """
+    给定一组 trace（候选路径），结合：
+      - 与已匹配链的 RMSD（结构一致性）
+      - 邻接得分 neigh_mat（局部几何连续性）
+      - AA 匹配得分 chain_cand_mat（氨基酸一致性）
+    计算每条 trace 的综合得分。
+    """
     global globalParam
     result=[]
     for trace in traces:
@@ -131,6 +183,13 @@ def calc_score(traces,chain_ix,this_seq):
 
 
 def localSeqStructAlign(fasta_ix,fasta_name,sub_seq):
+    """
+    对于一个局部序列窗口 sub_seq，枚举所有 local trace，分别计算：
+      - AA_score：序列与 Cα 候选的匹配得分
+      - nei_score：邻接得分
+      - af2_rmsd：与 AlphaFold 模板的 RMSD
+    返回上述三元组列表，用于 seqStructScoring 中综合成结构对齐得分。
+    """
     global globalParam
     AF2_split = globalParam.fastas[fasta_name].AF2_struct[sub_seq]
     score_list=[]
@@ -144,6 +203,13 @@ def localSeqStructAlign(fasta_ix,fasta_name,sub_seq):
 
 
 def registerScoring(fasta_ix,fasta_name,seq_ix,radius):
+    """
+    以某个中心残基 seq_ix 为起点，在其两侧各扩展 radius，
+    搜索与 AlphaFold 模板局部片段对齐良好的 Cα trace，并用 CA_prob_sum（落在高概率区域的体素和）打分。
+
+    返回：
+        若干候选 (score, trace, this_seq_range, transformed_AF2_coords)。
+    """
     global globalParam
     this_seq=range(seq_ix-radius,seq_ix+radius+1)
     this_fasta=globalParam.fastas[fasta_name]
@@ -221,6 +287,14 @@ def registerScoring(fasta_ix,fasta_name,seq_ix,radius):
 
 
 def run_pulchra(dir,pulchar_path,pdbfile,name):
+    """
+    使用 PULCHRA 对 Cα-only 结构做全原子重建。
+
+    步骤：
+      1. 按链/连续残基段切分 Cα PDB 为多个小片段；
+      2. 在每个片段上调用 pulchra 可执行文件，生成 .rebuilt.pdb；
+      3. 将所有重建的片段重新拼接为一个 all_atom_model.pdb。
+    """
     cspath = os.path.join(dir,f'chain_split/{name}')
     if os.path.exists(cspath):
         shutil.rmtree(cspath)
@@ -328,6 +402,11 @@ def run_pulchra(dir,pulchar_path,pdbfile,name):
 
 
 def get_seq(inp):
+    """
+    AFDB 相关的并行封装函数。
+
+    当前实现只简单地把输入拆开再返回（占位），以保持 Pool.map 的接口一致性。
+    """
     seq_obj,chain_strs = inp
     un_exist=False
     
@@ -367,7 +446,13 @@ def interpolate_missing_cas(ca_array):
 
 class CryoProcesser:
     def __init__(self,dynamic_config):
-        # init
+        """
+        AutoEM 主控类。
+
+        dynamic_config 一般就是命令行的 args，里面的字段在 README 的“Command-line Arguments”中有说明。
+        你可以把它看成整个“从 map 到 (X, C, S)” 的状态机。
+        """
+        # 根据 protocol 决定后面某些分支行为
         if dynamic_config.protocol =='temp_free':
             self.method_name='seq'
         elif 'seq_free' in dynamic_config.protocol:
@@ -416,6 +501,15 @@ class CryoProcesser:
     
 
     def get_spatial_feature(self,BB_model,CA_model,AA_model):
+        """
+        顶层 API：从 EM map 中提取空间特征（主要是 Cα 候选点云及其邻接/AA 概率）。
+
+        对于非 seq_free 协议，还会先调用 checkSeq() 解析 fasta / AFDB 模板。
+        最终效果：
+          - self.normEM, self.offset 由 preprocessEM 填充
+          - self.CAProb, self.AAPred, NNPred.* 由 nnPred 填充
+          - self.CA_cands, self.neigh_mat, self.neighbors* 由 clustering 填充
+        """
         if 'seq_free' not in self.dynamic_config.protocol:
             checkSeqRes=self.checkSeq()
             if checkSeqRes != 'success':
@@ -424,6 +518,14 @@ class CryoProcesser:
         self.nnProcess(BB_model,CA_model,AA_model)
 
     def mapping(self):
+        """
+        顶层 API：把 Cα 候选点 / 邻接图 / 序列信息“串”成一组链（X, C, S）。
+
+        - 对 seq_free 协议：只进行 fragModeling，直接输出 X, C, S（S 为根据预测氨基酸概率生成的伪序列）。
+        - 对其他协议：依次执行：
+            fragModeling → seqMapAligning → initialModeling → gapThreading
+          得到与真实序列对齐、空洞尽量被填补的结构。
+        """
         start_time=time.time()
         print('fragModeling...')
         X, C, S = self.fragModeling()
@@ -450,6 +552,13 @@ class CryoProcesser:
         return X, C, S
 
     def get_seq(self):
+        """
+        针对 denovo 协议：从已经对齐好的 self.fastas 结构中提取：
+          - C: 每个残基的链编号
+          - S: 整体序列（列表形式）
+
+        注意：这里不构造坐标 X，仅提供链/序列信息给后续 structure_model 使用。
+        """
         C, S = [], []
         chain_counts = 1
         for fasta_ix, fasta_name in enumerate(self.fastas):
@@ -467,6 +576,12 @@ class CryoProcesser:
             
 
     def nnProcess(self,BB_model,CA_model,AA_model):
+        """
+        UNet 推理流水线：
+          1. preprocessEM(): EM map 预处理（转轴 / 重采样 / 归一化 / 裁剪）
+          2. nnPred(): 调用 BB/CA/AA 三个 3D UNet，对整个体素网格做预测
+          3. clustering(): 从体素概率中提取稀疏的 Cα 候选点云和邻接结构
+        """
         start_time=time.time()
         print('preprocessEM...')
         self.preprocessEM()
@@ -487,6 +602,18 @@ class CryoProcesser:
 
 
     def fragModeling(self):
+        """
+        使用图算法把 Cα 候选点连成“连续片段”（fragments）。
+
+        大致思路：
+        - 构建一个无向图：点是 Cα 候选，边权为邻接得分 self.neigh_mat
+        - 经过一系列删边/合并操作，把局部高度连接的点组成线性片段
+        - 再把太多的小片段按照几何距离合并，得到较长的 trace
+
+        最终输出用于：
+        - seq_free 协议：直接把这些片段串成多条链 → X, C, S
+        - 其他协议：为后续的序列对齐 / gapThreading 提供空间骨架
+        """
         cand_graph=nx.Graph()
         edge_list=[]
         for cand in range(self.CA_cands.shape[0]):
@@ -592,6 +719,13 @@ class CryoProcesser:
 
 
     def seqMapAligning(self):
+        """
+        基于序列和局部几何，把片段（fragments）与 fasta 序列进行对齐。
+
+        主要调用：
+        - prepareSeq4Align(): 建立 (fasta, 残基, Cα 候选) 的 AA 得分矩阵
+        - getNHopMat() + quasiSeqAlign(): 利用 n-hop 传播把局部一致性扩散到更长片段
+        """
         self.prepareSeq4Align()
         start_time=time.time()
         print('seqStructureAlign...')
@@ -604,6 +738,12 @@ class CryoProcesser:
 
 
     def initialModeling(self):
+        """
+        初始建模：基于对齐结果，为每条链选出一组片段组合，填充到链的 result 数组中。
+
+        - self.fastas[fasta_name].chain_dict[chain_id].result
+          保存了链上每个残基对应的 Cα 候选下标（-1 表示当前还没有匹配到）
+        """
         for fasta_ix in range(len(self.alignedFrags)):
             self.fastas[self.fasta_list[fasta_ix]].seq_matched_traces=[]
             self.fastas[self.fasta_list[fasta_ix]].trace_matched_seqs=[]
@@ -867,6 +1007,15 @@ class CryoProcesser:
 
 
     def gapThreading(self):
+        """
+        在 initialModeling 之后，对链上的“空洞区间”（result == -1 的连续段）做线程填补。
+
+        大致步骤：
+        - 基于 seq_cand_AA_mat 和 n-hop 邻接构造 chain_cand_mat（候选残基-候选 Cα 的得分）
+        - 找到每个链上的空洞区间 (start, end)
+        - 通过 fillGap() 在几何 / AA / 对称性约束下，从两端“向中间”填充 Cα 候选
+        - 最后汇总得到整条链的 X, C, S
+        """
         atom_ix=0
         for fasta_ix, fasta_name in enumerate(self.fastas):
             this_fasta = self.fastas[fasta_name]
@@ -985,6 +1134,9 @@ class CryoProcesser:
 
     
     def phenix_refine(self,all_atom_model):
+        """
+        （可选）调用 Phenix 进行 real-space refine，将全原子模型与密度图进一步精修对齐。
+        """
         phenix_param=os.path.abspath(self.dynamic_config.phenix_param)
         phenix_act=os.path.abspath(self.dynamic_config.phenix_act)
         output_dir=os.path.abspath(self.dynamic_config.output_dir)
@@ -995,6 +1147,9 @@ class CryoProcesser:
 
 
     def time_record(self):
+        """
+        把各阶段记录在 self.time_cost 中的用时写入 CSV，方便之后做 profiling。
+        """
         with open(self.time_log,'w') as w:
             w.write('step,time\n')
             for key in self.time_cost:
@@ -1002,12 +1157,26 @@ class CryoProcesser:
 
 
     def preprocessEM(self):
+        """
+        打开 mrc 格式的密度图，调用 utils.processEMData 进行：
+          - 轴顺序/像素尺寸整理
+          - 裁剪到非零区域
+          - 归一化到 [0, 1]
+        """
         EMmap = mrcfile.open(self.dynamic_config.map_path)
         self.normEM, self.offset = utils.processEMData(EMmap)
         EMmap.close()
 
 
     def nnPred(self,BB_model,CA_model,AA_model):
+        """
+        使用三个 3D UNet（BB_model / CA_model / AA_model）在密度图上做滑窗预测。
+
+        输出：
+          - NNPred.BBProb: 每个体素属于主链的概率
+          - self.CAProb: 每个体素属于 Cα 的概率
+          - self.AAPred / NNPred.AAProb: 每个体素的氨基酸类别预测结果及概率
+        """
         with torch.no_grad():
             padded_em = np.pad(self.normEM, [(8, 64 - (self.normEM.shape[0]) % 48), (8, 64 - (self.normEM.shape[1]) %
                             48), (8, 64 - (self.normEM.shape[2]) % 48)], 'constant', constant_values=[(0, 0), (0, 0), (0, 0)])
@@ -1045,6 +1214,16 @@ class CryoProcesser:
 
 
     def clustering(self):
+        """
+        基于 CAProb 和 BBProb，从体素级概率图中提取离散的 Cα 候选点 self.CA_cands。
+
+        关键步骤：
+          - DBSCAN 聚类粗滤噪声
+          - 以簇内 BBProb 均值筛掉低置信度簇
+          - NMS 选出稀疏的候选点
+          - 计算候选点之间的距离矩阵、自适应邻接列表和边权矩阵 neigh_mat
+        这些结果会被后续 fragModeling / 对齐 / gapThreading 频繁使用。
+        """
         pcd_numpy = np.array(np.where(self.CAProb > self.dynamic_config.CA_score_thrh)).T
         pcd_numpy = pcd_numpy.astype(np.float64)
         pcd_raw = o3d.geometry.PointCloud()
@@ -1154,6 +1333,14 @@ class CryoProcesser:
 
 
     def checkSeq(self):
+        """
+        解析 fasta 文件，构建 self.fastas / self.fasta_list / self.chain_id_list 等序列相关结构。
+
+        同时会：
+          - 过滤掉过短或非蛋白的序列
+          - 把非法氨基酸替换为 ALA 并给出 warning
+          - （temp_flex 协议下）准备查询 AFDB 所需的信息
+        """
         print(self.dynamic_config.fasta_path)
         if os.path.exists(self.dynamic_config.fasta_path):
             fasta_lines=open(self.dynamic_config.fasta_path).readlines()
@@ -1256,6 +1443,12 @@ class CryoProcesser:
 
 
     def prepareSeq4Align(self):
+        """
+        构建三维张量 seq_cand_AA_mat：
+            [fasta_idx, 序列位置, Cα 候选] → 该残基为该候选的 AA 匹配得分。
+
+        后续 seqMapAligning / seqStructScoring 都会以此为基础做传播和对齐。
+        """
         self.seq_cand_AA_mat = np.zeros([len(self.fastas), self.max_seq_len, self.CA_cands.shape[0]]).astype(float)
         for i, fasta_name in enumerate(self.fastas):
             for j, AA in enumerate(self.fastas[fasta_name].sequence):
@@ -1267,6 +1460,14 @@ class CryoProcesser:
 
 
     def seqStructureAlign(self):
+        """
+        主序列对齐流程（不含 gap 填补）：
+          1. getNHopMat(): 计算 n-hop 传播矩阵，编码邻接图上的路径信息；
+          2. quasiSeqAlign(connect_len=5)：先找一批较短但置信度高的片段；
+          3. quasiSeqAlign(connect_len=9)：在前一步基础上，利用 cand_match_result 再扩展更长片段。
+
+        结果会写入 self.alignedFrags，供 initialModeling 使用。
+        """
         self.n_hop_mat = self.getNHopMat()
 
         connect_len=5
@@ -1285,6 +1486,14 @@ class CryoProcesser:
 
 
     def getNHopMat(self):
+        """
+        构建 n-hop 传播矩阵 n_hop_mat：
+            n_hop_mat[n, i, j] 表示：从 i 出发走 n+1 步后到达 j 的归一化权重。
+
+        实现方式：
+          - 利用全局变量 globalParam 和 pathWalking，在每个起点 i 上并行做随机游走；
+          - 对得到的多条路径进行汇总和归一化。
+        """
         n_hop_mat = np.zeros([self.dynamic_config.n_hop,self.cand_self_dis.shape[0],self.cand_self_dis.shape[0]])
         global globalParam
         globalParam.update(self.seq_cand_AA_mat, self.neigh_mat,neighbors2to6=self.best_neigh)
@@ -1308,6 +1517,12 @@ class CryoProcesser:
 
 
     def quasiSeqAlign(self,connect_len):
+        """
+        “近似序列对齐”过程：
+          - 通过 n-hop 传播，把单点的 AA 匹配得分扩散到局部片段上；
+          - 贪心地从得分最高的 Cα 候选开始，向两侧延展，得到长度 ≥ connect_len 的片段；
+          - 更新 alignedFrags / cand_match_result，并将已使用的候选从得分图中抹去。
+        """
         self.seq_align_score=self.seq_cand_AA_mat_copy.copy()
         for i in range(self.dynamic_config.n_hop):
             self.seq_align_score+=np.pad(self.seq_cand_AA_mat_copy[:,:-i-1,:],[(0,0),(i+1,0),(0,0)],constant_values=(0,0))@self.n_hop_mat[i].T+np.pad(self.seq_cand_AA_mat_copy[:,i+1:,:],[(0,0),(0,i+1),(0,0)],constant_values=(0,0))@self.n_hop_mat[i].T
@@ -1337,6 +1552,15 @@ class CryoProcesser:
     
 
     def findAlignedFrag(self,fasta_ix,seq_ix,cand_ix):
+        """
+        在 seq_cand_AA + neigh_mat 组合得分图上，以 (seq_ix, cand_ix) 为种子，
+        向两侧扩展，寻找得分最高的连续 (trace, seq) 片段。
+
+        返回：
+          - traces: Cα 索引列表
+          - seqs:   对应的序列位置列表
+          - scores: 每一步扩展时的局部得分列表
+        """
         traces=[[cand_ix]]
         seqs = [[seq_ix]]
         scores=[[self.seq_align_score[fasta_ix,seq_ix,cand_ix]]]
@@ -1425,6 +1649,12 @@ class CryoProcesser:
 
 
     def seqRegisterScoring(self):
+        """
+        利用 seqStructScoring 计算“局部序列+结构”的匹配情况，
+        然后在每个序列位置上调用 registerScoring 估计 registerScores。
+
+        主要用于评估在 AF2 模板约束下，每条 fasta 的整体可对齐程度。
+        """
         self.seqStructScoring()
         result_list=[]
         for fasta_ix in range(len(self.fastas)):
@@ -1463,6 +1693,12 @@ class CryoProcesser:
     
 
     def seqStructScoring(self):
+        """
+        结构对齐评分主流程：
+          - 构建长度为 struct_len 的局部 Cα 轨迹（self.local_traces）；
+          - 对每个序列窗口调用 localSeqStructAlign，比较 AA / 邻接 / 与 AF2 的 RMSD；
+          - 将结果写入 self.struct_match，并通过 n-hop 传播得到 seq_struct_align_score。
+        """
         self.n_hop_mat = self.getNHopMat()
 
         self.local_traces=[]
@@ -1523,6 +1759,13 @@ class CryoProcesser:
 
 
     def registerExpand(self, chains, fasta_ix):
+        """
+        对 registerScoring 得到的一组链候选 (chains)，尝试向两端扩展以覆盖更长的序列区间，
+        并重新根据 CA_prob_sum 进行打分。
+
+        输出：
+          - [this_seq, this_trace, CA_prob_sum] 列表，代表更长区间的对齐候选。
+        """
         fasta_name=self.fasta_list[fasta_ix]
         this_fasta=self.fastas[fasta_name]
         seq_len=len(this_fasta.sequence)
@@ -1583,6 +1826,12 @@ class CryoProcesser:
  
 
     def fillGap(self,fasta_ix,start_end):
+        """
+        针对某条链上的一个“空洞区间” start_end，在空间邻接图和 AA/模板约束下，从两端向中间搜索补全路径。
+
+        输出效果：
+          - 更新 this_fasta.chain_dict[chain_id].result，使该区间中尽可能多的残基被分配 Cα 候选。
+        """
         fasta_name=self.fasta_list[fasta_ix]
         this_fasta = self.fastas[fasta_name]
         seq_len = len(this_fasta.sequence)
